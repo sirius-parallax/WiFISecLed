@@ -6,8 +6,10 @@ Autonomous WiFi Auditor — OLED version
 - читаем stdout wifite и выводим короткий статус/текущую цель
 - сохраняем и показываем историю взломанных сетей, время работы и используем весь дисплей
 """
+import io
 import json
 import os
+import pty
 import re
 import shlex
 import signal
@@ -88,7 +90,7 @@ def prepare_display_lines(status_lines):
     status_lines = [str(x).strip() for x in (status_lines or [])]
     line_height = FONT_SIZE + 2
     max_lines = max((OLED_HEIGHT - 4) // line_height, 8)
-    reserved_slots = 7  # ╔, STAT, INFO, -, UPTIME, CLOCK, ╚
+    reserved_slots = 7
     allowed_extras = max(0, max_lines - reserved_slots)
 
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -233,16 +235,38 @@ def merge_history(existing, new_entries):
     return list(combined.values())
 
 
-def wifite_status_reader(proc):
+def spawn_wifite_process(cmd):
+    master_fd, slave_fd = pty.openpty()
+    proc = subprocess.Popen(
+        cmd,
+        shell=True,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        close_fds=True,
+        text=False,
+    )
+    os.close(slave_fd)
+    reader = io.TextIOWrapper(
+        os.fdopen(master_fd, "rb", closefd=False),
+        encoding="utf-8",
+        errors="ignore",
+        newline="\n",
+    )
+    return proc, reader
+
+
+def wifite_status_reader(reader):
     global latest_status
-    for raw_line in iter(proc.stdout.readline, ""):
+    for raw_line in reader:
         if not raw_line:
-            break
-        line = raw_line.rstrip("\n")
-        if line.startswith("Script started") or line.startswith("Script done"):
             continue
-        print(line, flush=True)
-        parsed = parse_wifite_status_line(line)
+        line = raw_line.rstrip("\n")
+        clean_line = strip_ansi_codes(line).strip()
+        if not clean_line:
+            continue
+        print(clean_line, flush=True)
+        parsed = parse_wifite_status_line(clean_line)
         if parsed:
             with status_lock:
                 latest_status = parsed
@@ -290,6 +314,82 @@ def parse_cracked_output(output):
     return unique
 
 
+def run_wifite_once(iface, history):
+    global latest_status
+    latest_status = ("WIFITE", "WAITING")
+    base_cmd = (
+        f"wifite -i {iface} --pow 40 -p 60 --pixie "
+        "--no-pmkid --wps-only --skip-crack"
+    )
+    cmd = base_cmd
+
+    print(f"🚀 {cmd}", flush=True)
+    update_status(["LAUNCH WIFITE", "WAITING..."])
+    time.sleep(1)
+
+    proc, reader = spawn_wifite_process(cmd)
+    reader_thread = threading.Thread(
+        target=wifite_status_reader,
+        args=(reader,),
+        daemon=True,
+    )
+    reader_thread.start()
+
+    while proc.poll() is None and running:
+        with status_lock:
+            status = latest_status
+        update_status([status[0][:20], status[1][:20]])
+        time.sleep(1)
+
+    proc.wait()
+    reader.close()
+    reader_thread.join(timeout=1)
+    update_status(["WIFITE DONE", f"CODE {proc.returncode}"])
+    print(f"[+] Wifite finished with code {proc.returncode}", flush=True)
+    time.sleep(1)
+
+    if proc.returncode == 0:
+        res = subprocess.run(
+            "wifite --cracked",
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0:
+            results = parse_cracked_output(res.stdout)
+            if results:
+                print(f"[+] Found {len(results)} new networks.", flush=True)
+                history = merge_history(history, results)
+                save_history(history)
+            else:
+                print("[-] No new cracked networks found.", flush=True)
+        else:
+            print(
+                f"[!] Failed to list cracked networks (code {res.returncode}).",
+                flush=True,
+            )
+    else:
+        print("[!] Wifite exited with non-zero status.", flush=True)
+
+    return history
+
+
+def display_history(history):
+    if not history:
+        update_status(["NO RESULTS", "YET"])
+        time.sleep(2)
+        return
+    print(f"[+] Showing {len(history)} stored networks on OLED.", flush=True)
+    for net in history:
+        essid = net["essid"][:16]
+        key = net["key"][:16]
+        update_status([f"SSID: {essid}", f"KEY: {key}"])
+        for _ in range(RESULT_DISPLAY_SECONDS):
+            if not running:
+                return
+            time.sleep(1)
+
+
 def main():
     global running
     if os.geteuid() != 0:
@@ -316,76 +416,18 @@ def main():
     os.system("rfkill unblock all")
     os.system(f"nmcli dev set {iface} managed no 2>/dev/null")
 
-    base_cmd = (
-        f"wifite -i {iface} --pow 40 -p 60 --pixie "
-        "--no-pmkid --wps-only --skip-crack"
-    )
-    cmd = f"script -q -c {shlex.quote(base_cmd)} /dev/null"
+    while running:
+        history = run_wifite_once(iface, history)
+        display_history(history)
 
-    print(f"🚀 {cmd}", flush=True)
-    update_status(["LAUNCH WIFITE", "WAITING..."])
-    time.sleep(1)
-
-    proc = subprocess.Popen(
-        cmd,
-        shell=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        universal_newlines=True,
-    )
-
-    reader_thread = threading.Thread(target=wifite_status_reader, args=(proc,), daemon=True)
-    reader_thread.start()
-
-    while proc.poll() is None and running:
-        with status_lock:
-            status = latest_status
-        update_status(
-            [
-                status[0][:20],
-                status[1][:20],
-            ]
-        )
-        time.sleep(1)
-
-    proc.wait()
-    reader_thread.join(timeout=1)
-    update_status(["WIFITE DONE", f"CODE {proc.returncode}"])
-    print(f"[+] Wifite finished with code {proc.returncode}", flush=True)
-    time.sleep(1)
-
-    res = subprocess.run("wifite --cracked", shell=True, capture_output=True, text=True)
-    results = parse_cracked_output(res.stdout) if res.returncode == 0 else []
-
-    if results:
-        print(f"[+] Found {len(results)} new networks, merging with history.", flush=True)
-        history = merge_history(history, results)
-        save_history(history)
-    else:
-        print("[-] No new cracked networks found.", flush=True)
-
-    if not history:
-        update_status(["NO RESULTS", "FOUND"])
-        print("[-] Total history empty.", flush=True)
-    else:
-        print(f"[+] Showing {len(history)} stored networks on OLED.", flush=True)
-        while running:
-            for net in history:
-                essid = net["essid"][:16]
-                key = net["key"][:16]
-                update_status([f"SSID: {essid}", f"KEY: {key}"])
-                for _ in range(RESULT_DISPLAY_SECONDS):
-                    if not running:
-                        break
-                    time.sleep(1)
+        for _ in range(10):
             if not running:
                 break
+            update_status(["IDLE", "RESTART IN 10s"])
+            time.sleep(1)
 
-    while running:
-        update_status(["IDLE", "NO DATA"])
-        time.sleep(60)
+    update_status(["STOPPED", "BY SIGNAL"])
+    print("[!] Exiting main loop.", flush=True)
 
 
 if __name__ == "__main__":
