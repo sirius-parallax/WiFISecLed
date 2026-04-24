@@ -1,147 +1,101 @@
 
 ---
 
-### 1. Обнови систему и установи необходимые пакеты
+### 1. Установи зависимости
+
 ```bash
 sudo apt update
-sudo apt upgrade -y
-sudo apt install -y python3 python3-pip git wifite util-linux \
-                   python3-pil python3-pil.imagetk python3-pil.imagetk \
-                   python3-setuptools python3-wheel \
-                   i2c-tools libfreetype6-dev libjpeg-dev build-essential
+sudo apt install -y python3-pip python3-pil git build-essential libatlas-base-dev wiringpi
+sudo pip3 install luma.oled
 ```
-- `wifite` — сам проводник по Wi-Fi.
-- `util-linux` — для команды `script`.
-- `python3-pil` и зависимые пакеты — для работы с OLED через `PIL`.
-- `i2c-tools` — диагностика шин I²C, если понадобится.
 
-Если в системе нет `pip`, оно уже через `python3-pip`.
+Если дисплей I²C, убедись, что включён в `raspi-config`‑аналогe или `/boot/armbianEnv.txt`.
 
 ---
 
-### 2. Установи Python-зависимости для OLED и `luma`
-```bash
-sudo pip3 install --upgrade luma.oled pillow
-```
+### 2. Склонируй/подготовь проект
 
----
-
-### 3. Клонируй или положи скрипт
-
-Создай директорию:
 ```bash
 sudo mkdir -p /opt/wifi-audit
-sudo chown $USER:$USER /opt/wifi-audit
+sudo chown "$USER":"$USER" /opt/wifi-audit
+cd /opt/wifi-audit
+# здесь могут быть дополнительные файлы, например скрипты установки
 ```
 
-Сохрани файл `wifite-oled.py` (тот полный скрипт, что мы обсуждали) в `/opt/wifi-audit/wifite-oled.py`. Убедись, что он исполняемый:
+---
+
+### 3. Запиши основной скрипт
+
 ```bash
-sudo cp wifite-oled.py /opt/wifi-audit/wifite-oled.py
-sudo chmod +x /opt/wifi-audit/wifite-oled.py
+sudo tee /usr/local/bin/wifite-oled.py >/dev/null <<'EOF'
+#!/usr/bin/env python3
+ТУТ САМ СКРИПТ
+EOF
+sudo chmod +x /usr/local/bin/wifite-oled.py
 ```
+
+*(Убедись, что вставляешь весь код из последнего ответа — в том числе с функцией `wifite_status_reader`, которая очищает ANSI-коды.)*
 
 ---
 
-### 4. Создай файл истории
+### 4. Создай systemd-сервис
+
 ```bash
-sudo mkdir -p /var/lib
-sudo touch /var/lib/wifite_history.json
-sudo chmod 600 /var/lib/wifite_history.json
-sudo chown root:root /var/lib/wifite_history.json
-```
-
----
-
-### 5. Проверь и настрой I²C
-- Включи I²C, если на системе (например, NanoPi) нужно через `raspi-config` или вручную в `/boot/armbianEnv.txt`.
-- Установи адрес дисплея, подключи проводкой.
-- Убедись, что `i2cdetect -y 1` показывает `0x3C`.
-
----
-
-### 6. Создай systemd-сервис
-
-Создай файл `/etc/systemd/system/wifite-oled.service`:
-```ini
+sudo tee /etc/systemd/system/wifite-oled.service >/dev/null <<'EOF'
 [Unit]
 Description=Wifite OLED auditor
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/opt/wifi-audit/wifite-oled.py
-Restart=always
-RestartSec=5
-KillMode=process
+ExecStart=/usr/local/bin/wifite-oled.py
+Restart=on-failure
+KillMode=control-group
+WorkingDirectory=/opt/wifi-audit
 StandardOutput=journal
-StandardError=journal
+StandardError=inherit
 
 [Install]
 WantedBy=multi-user.target
+EOF
 ```
 
 ---
 
-### 7. Включи и запусти службу
+### 5. Применить и запустить сервис
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now wifite-oled.service
-```
-
-Проверь статус:
-```bash
-sudo systemctl status wifite-oled.service
 sudo journalctl -u wifite-oled.service -f
 ```
 
 ---
 
-### 8. (Опционально) Настрой сеть
+### 6. (опционально) Управление
 
-Если система автоматически запускает `NetworkManager`, можешь отключить управление Wi-Fi-интерфейсом:
-```bash
-sudo nmcli dev set wlan0 managed no
-```
-или, если интерфейс другой — подставь имя, которое выдаёт `ls /sys/class/net | grep '^wl' | head -1`.
+- **Остановить:** `sudo systemctl stop wifite-oled.service`
+- **Перезапустить:** `sudo systemctl restart wifite-oled.service`
+- **Проверить статус:** `sudo systemctl status wifite-oled.service`
 
 ---
 
-### 9. Перезагрузка
+### 7. Сохраняем историю взломанных сетей
 
-После установки оборудование (включая OLED) должно работать автоматически. Перезагрузи систему, чтобы убедиться, что служба стартует при загрузке:
+Скрипт пишет `/var/lib/wifite_history.json`. Убедись, что папка доступна:
+
 ```bash
-sudo reboot
-```
-
----
-
-### 10. Отладка
-
-Если нужно вручную остановить/перезапустить:
-```bash
-sudo systemctl restart wifite-oled.service
-sudo systemctl stop wifite-oled.service
-```
-
-Для чтения выводов (в том числе списка в консоли о ранее взломанных сетях):
-```bash
-sudo journalctl -u wifite-oled.service
+sudo mkdir -p /var/lib
+sudo chown root:root /var/lib
+sudo touch /var/lib/wifite_history.json
+sudo chmod 600 /var/lib/wifite_history.json
 ```
 
 ---
 
-### Дополнительно
-- Убедись, что у пользователя `root` есть доступ к I²C и `wifite`.
-- Если OLED требуется другой адрес/размер — поправь константы `OLED_ADDRESS`, `OLED_WIDTH`/`HEIGHT`.
-- На `NanoPi` и других SBC может быть другая разметка `/boot/armbianEnv.txt`, проверь и включи `i2c1=on` и т. д.
+### 8. Итого
 
----
-
-Таким образом после этих действий у тебя будет полноценный сервис, который:
-- запускается при старте системы,
-- оборачивает `wifite` в TTY (через `script`),
-- показывает историю и статус на OLED,
-- сохраняет найденные ключи в `/var/lib/wifite_history.json`,
-- автоматически перезапускается при падениях.
+- Скрипт читает `wifite` через PTY, пилит OLED-интерфейс и фильтрует вывод в систему логов.
+- Юнит `KillMode=control-group` гарантирует, что `wifite`, `reaver` и другие дочерние процессы убиваются при остановке.
+- В логах `journalctl -u wifite-oled.service` будет чистый текст без `[xxxB blob data]`.
 
